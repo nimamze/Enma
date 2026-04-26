@@ -21,12 +21,13 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-    "core.apps.CoreConfig",
-    "accounts.apps.AccountsConfig",
     "drf_yasg",
     "rest_framework",
     "rest_framework.authtoken",
     "django_celery_results",
+    "core.apps.CoreConfig",
+    "accounts.apps.AccountsConfig",
+    "addresses.apps.AddressesConfig",
 ]
 
 MIDDLEWARE = [
@@ -204,3 +205,5 @@ OTP_TTL = int(os.getenv("OTP_TIME_VALIDATION", 300))
 OTP_AUTHORIZATION_TTL = int(os.getenv("SIGN_UP_OTP_TIME_VALIDATION", 300))
 OTP_SIGNUP_TTL = int(os.getenv("SIGN_UP_OTP_TIME_VALIDATION", 86400))
 OTP_RATE_LIMIT_TTL = int(os.getenv("SIGN_UP_OTP_TIME_VALIDATION", 86400))
+
+MAPIR_API_KEY = os.getenv("MAPIR_API_KEY")
