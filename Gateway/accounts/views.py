@@ -15,13 +15,13 @@ from .serializers import (
 from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
 from .utils.jwt_blacklist import blacklist_access_token
 from django.core.cache import cache
-from Project.Enma.Gateway.core.utils.tasks import send_email_task, send_sms_task
+from core.utils.tasks import send_email_task, send_sms_task
 from django.conf import settings
 from rest_framework import serializers
 import secrets
 from django.db import IntegrityError, transaction
-from Project.Enma.Gateway.accounts.utils.rate_limit import atomic_rate_limit
-from Project.Enma.Gateway.accounts.utils.otp_consume import consume_otp_authorization
+from accounts.utils.rate_limit import atomic_rate_limit
+from accounts.utils.otp_consume import consume_otp_authorization
 
 RATE_LIMIT_PASSWORD_CHANGE = settings.RATE_LIMIT_PASSWORD_CHANGE
 RATE_LIMIT_PHONE_CHANGE = settings.RATE_LIMIT_PHONE_CHANGE

@@ -5,4 +5,4 @@ class CoreConfig(AppConfig):
     name = "core"
 
     def ready(self):
-        import Project.Enma.Gateway.core.utils.signals
+        import core.utils.signals
