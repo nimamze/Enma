@@ -75,7 +75,7 @@ class SendOtpView(APIView):
             send_email_task.delay(email, f"your code is {otp}")  # type: ignore
         else:
             send_sms_task.delay(phone, f"your code is {otp}")  # type: ignore
-        return Response({"detail": "OTP sent"}, status=200)
+        return Response({"detail": "OTP sent"}, status=status.HTTP_200_OK)
 
 
 class VerifyOtpView(APIView):
@@ -121,7 +121,7 @@ class VerifyOtpView(APIView):
         can_key_target = phone if phone else email
         ttl = OTP_SIGNUP_TTL if purpose == "sign_up" else OTP_TTL
         cache.set(f"can_{purpose}:{can_key_target}", True, ttl)
-        return Response({"detail": "OTP verified"}, status=200)
+        return Response({"detail": "OTP verified"}, status=status.HTTP_200_OK)
 
 
 def logOut(request):
@@ -169,7 +169,9 @@ class LogOut(APIView):
         if result:
             return Response({"detail": "Logged out successfully."})
         else:
-            return Response({"detail": "Invalid token."}, status=400)
+            return Response(
+                {"detail": "Invalid token."}, status=status.HTTP_400_BAD_REQUEST
+            )
 
 
 class ProfileView(APIView):
@@ -249,19 +251,27 @@ class PhoneChangeView(APIView):
             max_attempts=1,
         )
         if not consume_otp_authorization(phone, "phone_change"):
-            return Response({"detail": "otp authorization failed"}, status=400)
+            return Response(
+                {"detail": "otp authorization failed"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         serializer = PhoneChangeSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         if data["previous_phone"] != phone:  # type: ignore
-            return Response({"detail": "previous phone doesn't match"}, status=400)
+            return Response(
+                {"detail": "previous phone doesn't match"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         try:
             with transaction.atomic():
                 user.phone = data["new_phone"]  # type: ignore
                 user.save()
         except IntegrityError:
-            return Response({"detail": "phone exists"}, status=400)
-        return Response({"detail": "phone changed"}, status=200)
+            return Response(
+                {"detail": "phone exists"}, status=status.HTTP_400_BAD_REQUEST
+            )
+        return Response({"detail": "phone changed"}, status=status.HTTP_200_OK)
 
 
 class PasswordChangeView(APIView):
@@ -275,11 +285,14 @@ class PasswordChangeView(APIView):
             max_attempts=1,
         )
         if not consume_otp_authorization(phone, "password_change"):
-            return Response({"detail": "otp authorization failed"}, status=400)
+            return Response(
+                {"detail": "otp authorization failed"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         serializer = PasswordChangeSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         new_password = serializer.validated_data["new_password"]  # type: ignore
         with transaction.atomic():
             user.set_password(new_password)
             user.save()
-        return Response({"detail": "password changed"}, status=200)
+        return Response({"detail": "password changed"}, status=status.HTTP_200_OK)
