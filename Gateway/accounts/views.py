@@ -10,43 +10,39 @@ from .serializers import (
     SendOtpSerializer,
     VerifyOtpSerializer,
     PasswordChangeSerializer,
+    PasswordForgetResetSerializer,
     PhoneChangeSerializer,
+    OtpPurpose,
+    OtpSendWay,
 )
 from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
+from django.utils import timezone
 from .utils.jwt_blacklist import blacklist_access_token
 from django.core.cache import cache
-from core.utils.tasks import send_email_task, send_sms_task
+from core.utils.tasks import enqueue_task, send_email_task, send_sms_task
 from django.conf import settings
 from rest_framework import serializers
 import secrets
 from django.db import IntegrityError, transaction
 from accounts.utils.rate_limit import atomic_rate_limit
 from accounts.utils.otp_consume import consume_otp_authorization
+from accounts.utils.jwt_blacklist import blacklist_user_refresh_tokens
 
-RATE_LIMIT_PASSWORD_CHANGE = settings.RATE_LIMIT_PASSWORD_CHANGE
-RATE_LIMIT_PHONE_CHANGE = settings.RATE_LIMIT_PHONE_CHANGE
-RATE_LIMIT_PASSWORD_RESET = settings.RATE_LIMIT_PASSWORD_RESET
-RATE_LIMIT_OTP_DAILY = settings.RATE_LIMIT_OTP_DAILY
-OTP_TTL = settings.OTP_TTL
-OTP_AUTHORIZATION_TTL = settings.OTP_AUTHORIZATION_TTL
-OTP_SIGNUP_TTL = settings.OTP_SIGNUP_TTL
-OTP_RATE_LIMIT_TTL = settings.OTP_RATE_LIMIT_TTL
+
+def build_otp_key(purpose, target):
+    return f"{purpose}_otp_send:{target}"
 
 
 class SendOtpView(APIView):
-    authentication_classes = []
     permission_classes = [AllowAny]
-
-    def otp_key(self, purpose, target):
-        return f"{purpose}_otp_send:{target}"
 
     def post(self, request):
         user = request.user
-        serializer = SendOtpSerializer(data=request.data)
+        serializer = SendOtpSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         if user.is_authenticated:
-            if data["send_way"] == "sms":  # type: ignore
+            if data["send_way"] == OtpSendWay.SMS:  # type: ignore
                 data["user_phone"] = user.phone  # type: ignore
             else:
                 data["user_email"] = user.email  # type: ignore
@@ -62,28 +58,24 @@ class SendOtpView(APIView):
         if email and not phone:
             atomic_rate_limit(
                 key=f"otp_send_email_limit:{purpose}:{email}",
-                ttl=OTP_RATE_LIMIT_TTL,
-                max_attempts=RATE_LIMIT_OTP_DAILY,
+                ttl=settings.OTP_RATE_LIMIT_TTL,
+                max_attempts=settings.RATE_LIMIT_OTP_DAILY,
             )
         target = phone if phone else email
-        otp_key = self.otp_key(purpose, target)
+        otp_key = build_otp_key(purpose, target)
         otp = cache.get(otp_key)
         if otp is None:
             otp = secrets.randbelow(900000) + 100000
             cache.set(otp_key, otp, settings.OTP_TTL)
-        if data["send_way"] == "email":  # type: ignore
-            send_email_task.delay(email, f"your code is {otp}")  # type: ignore
+        if data["send_way"] == OtpSendWay.EMAIL:  # type: ignore
+            enqueue_task(send_email_task, email, f"your code is {otp}")  # type: ignore
         else:
-            send_sms_task.delay(phone, f"your code is {otp}")  # type: ignore
+            enqueue_task(send_sms_task, phone, f"your code is {otp}")  # type: ignore
         return Response({"detail": "OTP sent"}, status=status.HTTP_200_OK)
 
 
 class VerifyOtpView(APIView):
-    authentication_classes = []
     permission_classes = [AllowAny]
-
-    def otp_key(self, purpose, target):
-        return f"{purpose}_otp_send:{target}"
 
     def post(self, request):
         serializer = VerifyOtpSerializer(
@@ -92,7 +84,7 @@ class VerifyOtpView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         if request.user.is_authenticated:
-            if data.get("send_way") == "sms":  # type: ignore
+            if data["send_way"] == OtpSendWay.SMS:  # type: ignore
                 data["user_phone"] = request.user.phone  # type: ignore
             else:
                 data["user_email"] = request.user.email  # type: ignore
@@ -103,24 +95,34 @@ class VerifyOtpView(APIView):
         if phone:
             atomic_rate_limit(
                 key=f"otp_verify_limit:{purpose}:{phone}",
-                ttl=OTP_RATE_LIMIT_TTL,
-                max_attempts=RATE_LIMIT_OTP_DAILY,
+                ttl=settings.OTP_RATE_LIMIT_TTL,
+                max_attempts=settings.RATE_LIMIT_OTP_DAILY,
             )
-            otp_key = f"{purpose}_otp_send:{phone}"
+            otp_key = build_otp_key(purpose, phone)
         else:
             atomic_rate_limit(
                 key=f"otp_verify_email_limit:{purpose}:{email}",
-                ttl=OTP_RATE_LIMIT_TTL,
-                max_attempts=RATE_LIMIT_OTP_DAILY,
+                ttl=settings.OTP_RATE_LIMIT_TTL,
+                max_attempts=settings.RATE_LIMIT_OTP_DAILY,
             )
-            otp_key = f"{purpose}_otp_send:{email}"
+            otp_key = build_otp_key(purpose, email)
         sent = cache.get(otp_key)
         if sent is None or str(sent) != str(otp):
             raise serializers.ValidationError("invalid or expired otp")
         cache.delete(otp_key)
-        can_key_target = phone if phone else email
-        ttl = OTP_SIGNUP_TTL if purpose == "sign_up" else OTP_TTL
-        cache.set(f"can_{purpose}:{can_key_target}", True, ttl)
+        can_key_targets = {phone if phone else email}
+        if request.user.is_authenticated:  # type: ignore
+            can_key_targets.add(request.user.phone)  # type: ignore
+            if request.user.email:  # type: ignore
+                can_key_targets.add(request.user.email)  # type: ignore
+        ttl = (
+            settings.OTP_SIGNUP_TTL
+            if purpose == OtpPurpose.SIGN_UP
+            else settings.OTP_AUTHORIZATION_TTL
+        )
+        for can_key_target in can_key_targets:
+            if can_key_target:
+                cache.set(f"can_{purpose}:{can_key_target}", True, ttl)
         return Response({"detail": "OTP verified"}, status=status.HTTP_200_OK)
 
 
@@ -151,7 +153,7 @@ class SignUpView(APIView):
         serializer = SignUpSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user_phone = serializer.validated_data["phone"]  # type: ignore
-        if consume_otp_authorization(user_phone=user_phone, purpose="sign_up"):
+        if consume_otp_authorization(target=user_phone, purpose=OtpPurpose.SIGN_UP):
             user = serializer.save()
             output = UserProfileSerializer(user)
             return Response({"detail": output.data}, status=status.HTTP_201_CREATED)
@@ -216,7 +218,8 @@ class SellerView(APIView):
         else:
             user_phone = user.phone
             if consume_otp_authorization(
-                user_phone=user_phone, purpose="become_seller"
+                target=user_phone,
+                purpose=OtpPurpose.BECOME_SELLER,
             ):
                 user.is_seller = True
                 user.save()
@@ -250,7 +253,9 @@ class PhoneChangeView(APIView):
             ttl=settings.RATE_LIMIT_PHONE_CHANGE,
             max_attempts=1,
         )
-        if not consume_otp_authorization(phone, "phone_change"):
+        if not consume_otp_authorization(
+            target=phone, purpose=OtpPurpose.PHONE_CHANGE
+        ):
             return Response(
                 {"detail": "otp authorization failed"},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -284,7 +289,10 @@ class PasswordChangeView(APIView):
             ttl=settings.RATE_LIMIT_PASSWORD_CHANGE,
             max_attempts=1,
         )
-        if not consume_otp_authorization(phone, "password_change"):
+        if not consume_otp_authorization(
+            target=phone,
+            purpose=OtpPurpose.PASSWORD_CHANGE,
+        ):
             return Response(
                 {"detail": "otp authorization failed"},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -294,5 +302,45 @@ class PasswordChangeView(APIView):
         new_password = serializer.validated_data["new_password"]  # type: ignore
         with transaction.atomic():
             user.set_password(new_password)
-            user.save()
+            user.tokens_invalid_before = timezone.now()  # type: ignore
+            user.save(update_fields=["password", "tokens_invalid_before"])
+            transaction.on_commit(lambda: blacklist_user_refresh_tokens(user))
         return Response({"detail": "password changed"}, status=status.HTTP_200_OK)
+
+
+class PasswordForgetResetView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = PasswordForgetResetSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        target = (
+            data["user_phone"]  # type: ignore
+            if data["send_way"] == OtpSendWay.SMS  # type: ignore
+            else data["user_email"]  # type: ignore
+        )
+        atomic_rate_limit(
+            key=f"password_reset_limit:{target}",
+            ttl=settings.RATE_LIMIT_PASSWORD_RESET,
+            max_attempts=1,
+        )
+        if not consume_otp_authorization(
+            target=target,
+            purpose=OtpPurpose.PASSWORD_FORGET,
+        ):
+            return Response(
+                {"detail": "otp authorization failed"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        user = data["user"]  # type: ignore
+        with transaction.atomic():
+            user.set_password(data["new_password"])  # type: ignore
+            user.tokens_invalid_before = timezone.now()  # type: ignore
+            user.save(update_fields=["password", "tokens_invalid_before"])
+            transaction.on_commit(lambda: blacklist_user_refresh_tokens(user))
+        return Response(
+            {"detail": "password reset successfully"},
+            status=status.HTTP_200_OK,
+        )
