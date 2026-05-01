@@ -1,16 +1,23 @@
 from django.core.mail import send_mail
+from django.core.files.storage import FileSystemStorage
 from celery import shared_task
+from celery.exceptions import OperationalError as BrokerConnectionError
 from django.conf import settings
 from django.core.management import call_command
-from django.contrib.auth import get_user_model
+from django.apps import apps
 from datetime import timedelta
 from django.utils import timezone
 from django.db.models import Q
-from .sms import send_sms
-import boto3
-from botocore.exceptions import ClientError
+from core.utils.sms import send_sms
 
-User = get_user_model()
+
+def enqueue_task(task, *args, **kwargs):
+    try:
+        task.delay(*args, **kwargs)
+    except BrokerConnectionError:
+        if not settings.DEBUG:
+            raise
+        task.apply(args=args, kwargs=kwargs)
 
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
@@ -42,8 +49,9 @@ def cleanup_expired_jwt_tokens():
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
 def send_email_for_not_login_users(self):
     try:
+        user_model = apps.get_model(settings.AUTH_USER_MODEL)
         one_month_ago = timezone.now() - timedelta(days=30)
-        inactive_users = User.objects.filter(
+        inactive_users = user_model.objects.filter(
             Q(last_login__lt=one_month_ago) | Q(last_login__isnull=True)
         )
         for user in inactive_users:
@@ -64,17 +72,12 @@ def delete_user_avatar_task(self, file_name):
         return
 
     try:
-        s3 = boto3.client(
-            "s3",
-            endpoint_url=settings.AWS_USERS_S3_ENDPOINT_URL,
-            aws_access_key_id=settings.AWS_USERS_ACCESS_KEY_ID,
-            aws_secret_access_key=settings.AWS_USERS_SECRET_ACCESS_KEY,
-        )
+        if settings.SAVE_FILES_LOCALLY:
+            storage = FileSystemStorage(location=settings.MEDIA_ROOT)
+        else:
+            from .storage_backends import UsersMediaStorage
 
-        s3.delete_object(
-            Bucket=settings.AWS_USERS_STORAGE_BUCKET_NAME,
-            Key=file_name,
-        )
-
-    except ClientError as exc:
+            storage = UsersMediaStorage()
+        storage.delete(file_name)
+    except Exception as exc:
         raise self.retry(exc=exc)
