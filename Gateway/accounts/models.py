@@ -1,17 +1,11 @@
+import uuid
 from django.contrib.auth.base_user import BaseUserManager
 from django.contrib.auth.models import AbstractUser
 from django.db import models, transaction
 from django.core.exceptions import ValidationError
-from core.models import SoftDeleteModel
-import uuid
-from django.conf import settings
-from core.utils.storage_backends import UsersMediaStorage
-from core.utils.tasks import delete_user_avatar_task
-
-if not settings.SAVE_FILES_LOCALLY:
-    users_storage = UsersMediaStorage()
-else:
-    users_storage = None
+from django.utils import timezone
+from core.models import SoftDeleteManager, SoftDeleteModel
+from accounts.utils.deletion import schedule_user_deleted_effects
 
 
 class UserDeletionBackup(models.Model):
@@ -28,7 +22,9 @@ class UserDeletionBackup(models.Model):
         return f"Backup for {self.user_id}"  # type: ignore
 
 
-class UserManager(BaseUserManager):
+class UserManager(SoftDeleteManager, BaseUserManager):
+    use_in_migrations = True
+
     def create_user(self, email, phone, password=None, **extra_fields):
         if not email:
             raise ValueError("Email is required")
@@ -62,35 +58,68 @@ class CustomUser(AbstractUser, SoftDeleteModel):
 
     image = models.ImageField(
         upload_to="users/avatars/",
-        storage=users_storage if users_storage else None,
         null=True,
         blank=True,
     )
     is_seller = models.BooleanField(default=False)
+    tokens_invalid_before = models.DateTimeField(null=True, blank=True)
     username = None
     USERNAME_FIELD = "phone"
     REQUIRED_FIELDS = ["email", "first_name", "last_name"]
     objects = UserManager()  # type: ignore
 
-    @transaction.atomic
-    def delete(self, using=None, keep_parents=False):
-        avatar_name = self.image.name if self.image else None
-
+    def backup_identity(self):
         UserDeletionBackup.objects.update_or_create(
             user=self,
             defaults={"email": self.email, "phone": self.phone},
         )
 
+    def mark_deleted(self):
         unique_suffix = uuid.uuid4().hex
         self.email = f"deleted__{unique_suffix}@deleted.local"
         self.phone = f"deleted__{unique_suffix}"
         self.is_deleted = True
         self.image = None
+        self.tokens_invalid_before = timezone.now()
 
-        self.save(update_fields=["email", "phone", "is_deleted", "image"])
+    def get_restore_value(self, field_name, original_value, replacement):
+        user_model = type(self)
+        conflict = (
+            user_model.objects.filter(**{field_name: original_value})
+            .exclude(id=self.id)  # type: ignore
+            .exists()
+        )
+        if not conflict:
+            return original_value
 
-        if avatar_name:
-            transaction.on_commit(lambda: delete_user_avatar_task.delay(avatar_name))  # type: ignore
+        if not replacement:
+            raise ValidationError(
+                f"Original {field_name} is already in use. Provide a new {field_name}."
+            )
+        replacement_conflict = user_model.objects.filter(
+            **{field_name: replacement}
+        ).exists()
+        if replacement_conflict:
+            raise ValidationError(f"New {field_name} is already in use.")
+        return replacement
+
+    @transaction.atomic
+    def delete(self, using=None, keep_parents=False):
+        avatar_name = self.image.name if self.image else None
+        email_to_notify = self.email
+
+        self.backup_identity()
+        self.mark_deleted()
+        self.save(
+            update_fields=[
+                "email",
+                "phone",
+                "is_deleted",
+                "image",
+                "tokens_invalid_before",
+            ]
+        )
+        schedule_user_deleted_effects(self, email_to_notify, avatar_name)
 
     @transaction.atomic
     def restore(self, new_email=None, new_phone=None):
@@ -100,46 +129,9 @@ class CustomUser(AbstractUser, SoftDeleteModel):
             backup = self.deletion_backup  # type: ignore
         except UserDeletionBackup.DoesNotExist:
             raise ValidationError("No backup exists for this user.")
-        target_email = backup.email
-        email_conflict = (
-            CustomUser.objects.filter(
-                email=target_email,
-                is_deleted=False,
-            )
-            .exclude(id=self.id)  # type: ignore
-            .exists()
-        )
-        if email_conflict:
-            if not new_email:
-                raise ValidationError(
-                    "Original email is already in use. Provide a new email."
-                )
-            if CustomUser.objects.filter(
-                email=new_email,
-                is_deleted=False,
-            ).exists():
-                raise ValidationError("New email is already in use.")
-            target_email = new_email
-        target_phone = backup.phone
-        phone_conflict = (
-            CustomUser.objects.filter(
-                phone=target_phone,
-                is_deleted=False,
-            )
-            .exclude(id=self.id)  # type: ignore
-            .exists()
-        )
-        if phone_conflict:
-            if not new_phone:
-                raise ValidationError(
-                    "Original phone is already in use. Provide a new phone."
-                )
-            if CustomUser.objects.filter(
-                phone=new_phone,
-                is_deleted=False,
-            ).exists():
-                raise ValidationError("New phone is already in use.")
-            target_phone = new_phone
+
+        target_email = self.get_restore_value("email", backup.email, new_email)
+        target_phone = self.get_restore_value("phone", backup.phone, new_phone)
         self.email = target_email
         self.phone = target_phone
         self.is_deleted = False
