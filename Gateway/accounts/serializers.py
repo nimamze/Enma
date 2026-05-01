@@ -1,12 +1,26 @@
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
+from django.db import models
 import phonenumbers
 from django.contrib.auth.password_validation import validate_password
 
 User = get_user_model()
 
 
-def phoneValidation(phone):
+class OtpSendWay(models.TextChoices):
+    SMS = "sms", "sms"
+    EMAIL = "email", "email"
+
+
+class OtpPurpose(models.TextChoices):
+    SIGN_UP = "sign_up", "sign_up"
+    BECOME_SELLER = "become_seller", "become_seller"
+    PHONE_CHANGE = "phone_change", "phone_change"
+    PASSWORD_CHANGE = "password_change", "password_change"
+    PASSWORD_FORGET = "password_forget", "password_forget"
+
+
+def validate_iran_phone(phone):
     try:
         phone = phonenumbers.parse(phone, "IR")
         if not phonenumbers.is_valid_number(phone):
@@ -17,6 +31,39 @@ def phoneValidation(phone):
         return phone
     except phonenumbers.NumberParseException:
         raise serializers.ValidationError("Invalid phone format")
+
+
+def validate_confirmed_password(password, password_confirm):
+    validate_password(password)
+    if password != password_confirm:
+        raise serializers.ValidationError(
+            "password and password_confirm are not same as each other!"
+        )
+
+
+def validate_otp_target(
+    data,
+    request,
+    phone_required_message,
+    email_required_message,
+):
+    send_way = data["send_way"]
+    purpose = data["purpose"]
+    if purpose == OtpPurpose.SIGN_UP and send_way != OtpSendWay.SMS:
+        raise serializers.ValidationError("sign up otp must be sent by sms")
+
+    if request and request.user.is_authenticated:  # type: ignore
+        return data
+
+    if send_way == OtpSendWay.SMS:
+        if not data.get("user_phone"):
+            raise serializers.ValidationError(phone_required_message)
+        data["user_phone"] = validate_iran_phone(data["user_phone"])
+        return data
+
+    if not data.get("user_email"):
+        raise serializers.ValidationError(email_required_message)
+    return data
 
 
 class SignUpSerializer(serializers.ModelSerializer):
@@ -39,19 +86,12 @@ class SignUpSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         password = validated_data.pop("password")
-        user = User.objects.create_user(password=password, **validated_data)
-        return user
+        validated_data.pop("password_confirm", None)
+        return User.objects.create_user(password=password, **validated_data)
 
     def validate(self, data):
-        password = data.get("password")
-        validate_password(password)
-        password_confirm = data.get("password_confirm")
-        if password != password_confirm:
-            raise serializers.ValidationError(
-                "password and password_confirm are not same as each other!"
-            )
-        phone = data.get("phone")
-        data["phone"] = phoneValidation(phone)
+        validate_confirmed_password(data.get("password"), data.get("password_confirm"))
+        data["phone"] = validate_iran_phone(data.get("phone"))
         return data
 
 
@@ -67,44 +107,34 @@ class UserUpdateSerializer(serializers.ModelSerializer):
         fields = ["first_name", "last_name", "image", "email"]
 
 
-class SendOtpSerializer(serializers.Serializer):
+class BaseOtpSerializer(serializers.Serializer):
     user_email = serializers.EmailField(required=False, allow_blank=True)
     user_phone = serializers.CharField(required=False, allow_blank=True)
-    send_way = serializers.ChoiceField(choices=[("sms", "sms"), ("email", "email")])
-    purpose = serializers.ChoiceField(
-        choices=[
-            ("sign_up", "sign_up"),
-            ("become_seller", "become_seller"),
-            ("phone_change", "phone_change"),
-            ("password_change", "password_change"),
-            ("password_forget", "password_forget"),
-        ]
-    )
+    send_way = serializers.ChoiceField(choices=OtpSendWay.choices)
+    purpose = serializers.ChoiceField(choices=OtpPurpose.choices)
+
+
+class SendOtpSerializer(BaseOtpSerializer):
 
     def validate(self, data):
-        send_way = data["send_way"]
-        if send_way == "sms":
-            if not data.get("user_phone"):
-                raise serializers.ValidationError("Phone required for sms")
-            data["user_phone"] = phoneValidation(data["user_phone"])
-        else:
-            if not data.get("user_email"):
-                raise serializers.ValidationError("Email required for email")
-        return data
+        return validate_otp_target(
+            data=data,
+            request=self.context.get("request"),
+            phone_required_message="Phone required for sms",
+            email_required_message="Email required for email",
+        )
 
 
-class VerifyOtpSerializer(serializers.Serializer):
+class VerifyOtpSerializer(BaseOtpSerializer):
     validation_otp = serializers.CharField(max_length=6)
-    user_phone = serializers.CharField(required=False, allow_blank=True)
-    purpose = serializers.ChoiceField(choices=[...])
 
     def validate(self, data):
-        request = self.context.get("request")
-        if not request.user.is_authenticated:  # type: ignore
-            if not data.get("user_phone"):
-                raise serializers.ValidationError("phone required for verify")
-            data["user_phone"] = phoneValidation(data["user_phone"])
-        return data
+        return validate_otp_target(
+            data=data,
+            request=self.context.get("request"),
+            phone_required_message="phone required for verify",
+            email_required_message="email required for verify",
+        )
 
 
 class PasswordChangeSerializer(serializers.Serializer):
@@ -112,13 +142,34 @@ class PasswordChangeSerializer(serializers.Serializer):
     new_confirm_password = serializers.CharField(write_only=True, required=True)
 
     def validate(self, data):
-        new_password = data.get("new_password")
-        validate_password(new_password)
-        new_confirm_password = data.get("new_confirm_password")
-        if new_password != new_confirm_password:
-            raise serializers.ValidationError(
-                "password and password_confirm are not same as each other!"
-            )
+        validate_confirmed_password(
+            data.get("new_password"),
+            data.get("new_confirm_password"),
+        )
+        return data
+
+
+class PasswordForgetResetSerializer(PasswordChangeSerializer):
+    user_email = serializers.EmailField(required=False, allow_blank=True)
+    user_phone = serializers.CharField(required=False, allow_blank=True)
+    send_way = serializers.ChoiceField(choices=OtpSendWay.choices)
+
+    def validate(self, data):
+        data = super().validate(data)
+        send_way = data["send_way"]
+        if send_way == OtpSendWay.SMS:
+            if not data.get("user_phone"):
+                raise serializers.ValidationError("phone required for password reset")
+            data["user_phone"] = validate_iran_phone(data["user_phone"])
+            lookup = {"phone": data["user_phone"]}
+        else:
+            if not data.get("user_email"):
+                raise serializers.ValidationError("email required for password reset")
+            lookup = {"email": data["user_email"]}
+        try:
+            data["user"] = User.objects.get(**lookup)
+        except User.DoesNotExist:
+            raise serializers.ValidationError("user not found")
         return data
 
 
@@ -127,8 +178,6 @@ class PhoneChangeSerializer(serializers.Serializer):
     new_phone = serializers.CharField(max_length=16, required=True)
 
     def validate(self, data):
-        new_phone = data.get("new_phone")
-        data["new_phone"] = phoneValidation(new_phone)
-        previous_phone = data.get("previous_phone")
-        data["previous_phone"] = phoneValidation(previous_phone)
+        data["new_phone"] = validate_iran_phone(data.get("new_phone"))
+        data["previous_phone"] = validate_iran_phone(data.get("previous_phone"))
         return data
