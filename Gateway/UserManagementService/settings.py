@@ -1,4 +1,3 @@
-# BASE_DIR = /mnt/newhome/nimamze/Documents/Code/Project/Enma/Gateway
 from pathlib import Path
 from dotenv import load_dotenv
 import os
@@ -6,13 +5,18 @@ from datetime import timedelta
 from celery.schedules import crontab
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-load_dotenv(BASE_DIR / ".env")
+PROJECT_ROOT = BASE_DIR.parent
+load_dotenv(PROJECT_ROOT / ".env")
 
 SECRET_KEY = os.getenv("SECRET_KEY")
 DEBUG = os.getenv("DEBUG_MODE", "True") == "True"
 SAVE_FILES_LOCALLY = os.getenv("SAVE_FILES_LOCALLY", "True") == "True"
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+    if host.strip()
+]
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -24,6 +28,7 @@ INSTALLED_APPS = [
     "drf_yasg",
     "rest_framework",
     "rest_framework.authtoken",
+    "rest_framework_simplejwt.token_blacklist",
     "django_celery_results",
     "core.apps.CoreConfig",
     "accounts.apps.AccountsConfig",
@@ -67,7 +72,7 @@ DATABASES = {
         "USER": os.getenv("DB_USER"),
         "PASSWORD": os.getenv("DB_PASSWORD"),
         "HOST": os.getenv("DB_HOST", "localhost"),
-        "PORT": "5432",
+        "PORT": os.getenv("DB_PORT", "5432"),
     }
 }
 
@@ -100,18 +105,31 @@ MEDIA_URL = "/media/"
 MEDIA_ROOT = os.path.join(BASE_DIR, "media")
 
 os.makedirs(MEDIA_ROOT, exist_ok=True)
+
+STORAGES = {
+    "default": {
+        "BACKEND": "django.core.files.storage.FileSystemStorage",
+    },
+    "staticfiles": {
+        "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+    },
+}
+
 if not SAVE_FILES_LOCALLY:
     INSTALLED_APPS += ["storages"]
     AWS_USERS_ACCESS_KEY_ID = os.getenv("S3_USERS_ACCESS_KEY")
     AWS_USERS_SECRET_ACCESS_KEY = os.getenv("S3_USERS_SECRET_KEY")
     AWS_USERS_STORAGE_BUCKET_NAME = os.getenv("S3_USERS_BUCKET_NAME")
     AWS_USERS_S3_ENDPOINT_URL = os.getenv("S3_USERS_ENDPOINT")
+    STORAGES["default"] = {
+        "BACKEND": "core.utils.storage_backends.UsersMediaStorage",
+    }
 
 
 AUTH_USER_MODEL = "accounts.CustomUser"
 
 AUTHENTICATION_BACKENDS = [
-    "accounts.backend.CustomAuthentication",
+    "accounts.utils.backends.CustomAuthentication",
     "django.contrib.auth.backends.ModelBackend",
 ]
 
@@ -128,13 +146,19 @@ SWAGGER_SETTINGS = {
 
 
 SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=15),
-    "REFRESH_TOKEN_LIFETIME": timedelta(days=1),
+    "ACCESS_TOKEN_LIFETIME": timedelta(
+        minutes=int(os.getenv("ACCESS_TOKEN_LIFETIME_MINUTES", 15))
+    ),
+    "REFRESH_TOKEN_LIFETIME": timedelta(
+        days=int(os.getenv("REFRESH_TOKEN_LIFETIME_DAYS", 1))
+    ),
     "ROTATE_REFRESH_TOKENS": True,
     "BLACKLIST_AFTER_ROTATION": False,
 }
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", f"{REDIS_URL}/0")
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", f"{REDIS_URL}/1")
 
 CACHES = {
     "default": {
@@ -154,27 +178,28 @@ CELERY_ACCEPT_CONTENT = ["application/json"]
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_TASK_SERIALIZER = "json"
 CELERY_TIMEZONE = "Asia/Tehran"
-CELERY_BROKER_URL = f"{REDIS_URL}/0"
-CELERY_RESULT_BACKEND = f"{REDIS_URL}/1"
+CELERY_RESULT_EXPIRES = int(os.getenv("CELERY_RESULT_EXPIRES", 259200))
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+CELERY_IMPORTS = ("core.utils.tasks",)
 
 EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER")
 
 CELERY_BEAT_SCHEDULE = {
     "cleanup-expired-jwt-tokens-every-night": {
-        "task": "core.tasks.cleanup_expired_jwt_tokens",
+        "task": "core.utils.tasks.cleanup_expired_jwt_tokens",
         "schedule": crontab(hour=2, minute=0),
     },
     "send-daily-email": {
-        "task": "core.tasks.send_email_for_not_login_users",
+        "task": "core.utils.tasks.send_email_for_not_login_users",
         "schedule": crontab(hour=3, minute=0),
     },
 }
 
 EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
-EMAIL_HOST = "smtp.gmail.com"
-EMAIL_PORT = 587
+EMAIL_HOST = os.getenv("EMAIL_HOST", "smtp.gmail.com")
+EMAIL_PORT = int(os.getenv("EMAIL_PORT", 587))
 EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD")
-EMAIL_USE_TLS = True
+EMAIL_USE_TLS = os.getenv("EMAIL_USE_TLS", "True") == "True"
 DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
 
 KAVENEGAR_API_KEY = os.getenv("KAVENEGAR_API_KEY")
@@ -182,7 +207,7 @@ KAVENEGAR_SENDER = os.getenv("KAVENEGAR_SENDER")
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
-        "accounts.authentication.RedisBlacklistJWTAuthentication",
+        "accounts.utils.authentication.RedisBlacklistJWTAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
