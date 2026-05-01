@@ -8,8 +8,8 @@ class UserAddresses(BaseModel):
         settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="addresses"
     )
     is_default = models.BooleanField(default=False)
-    latitude = models.FloatField(db_index=True)
-    longitude = models.FloatField(db_index=True)
+    latitude = models.FloatField(db_index=True, null=True, blank=True)
+    longitude = models.FloatField(db_index=True, null=True, blank=True)
     title = models.CharField(max_length=50, blank=True, null=True)
     province = models.CharField(max_length=100)
     city = models.CharField(max_length=100)
@@ -18,6 +18,15 @@ class UserAddresses(BaseModel):
     plaque = models.CharField(max_length=20)
     unit = models.CharField(max_length=20, blank=True, null=True)
     postal_code = models.CharField(max_length=20)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user"],
+                condition=models.Q(is_default=True),
+                name="unique_default_address_per_user",
+            )
+        ]
 
     @property
     def full_address(self):
